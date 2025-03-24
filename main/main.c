@@ -9,7 +9,7 @@
 #include "pico/stdlib.h"
 #include <stdio.h>
 
-// Constantes dos botões e LEDs (mantidas conforme solicitado)
+// Constantes fornecidas (mantidas)
 const uint BTN_1_OLED = 28;
 const uint BTN_2_OLED = 26;
 const uint BTN_3_OLED = 27;
@@ -22,81 +22,85 @@ const uint LED_3_OLED = 22;
 const uint PIN_ECHO = 7;
 const uint PIN_TRIGGER = 6;
 
-// Filas e semáforo para comunicação entre tarefas
+// Filas e semáforo
 QueueHandle_t queueMedidasTempo;
 QueueHandle_t queueDistancias;
 SemaphoreHandle_t semaforoDisparo;
 
-// Flag de estado para borda de subida/descida
-volatile bool aguardandoSubida = true;
-
-// Interrupção do pino de ECHO
+// Callback de interrupção no ECHO
 void tratador_interrupcao_echo(uint gpio, uint32_t eventos) {
-    static int instanteSubida = 0;
-    int tempoAtual = to_us_since_boot(get_absolute_time());
+    int timestamp = to_us_since_boot(get_absolute_time());
 
-    if (aguardandoSubida && (eventos & GPIO_IRQ_EDGE_RISE)) {
-        instanteSubida = tempoAtual;
-        aguardandoSubida = false;
-    } else if (!aguardandoSubida && (eventos & GPIO_IRQ_EDGE_FALL)) {
-        int duracaoPulso = tempoAtual - instanteSubida;
-        xQueueSendFromISR(queueMedidasTempo, &duracaoPulso, NULL);
-        aguardandoSubida = true;
-    }
+    // Armazena qualquer borda (subida ou descida)
+    xQueueSendFromISR(queueMedidasTempo, &timestamp, NULL);
 }
 
 // Tarefa que dispara o sinal ultrassônico
 void tarefa_disparo_ultrassom(void *param) {
+    gpio_init(PIN_TRIGGER);
+    gpio_set_dir(PIN_TRIGGER, GPIO_OUT);
+
     while (true) {
         if (xSemaphoreTake(semaforoDisparo, pdMS_TO_TICKS(200))) {
             gpio_put(PIN_TRIGGER, 1);
-            sleep_us(10); // Pulso de 10 microsegundos
+            sleep_us(10); // Pulso de 10us
             gpio_put(PIN_TRIGGER, 0);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-// Tarefa que mede a resposta do sensor
+// Tarefa que mede a distância
 void tarefa_medicao_echo(void *param) {
-    int tempoPulso = 0;
+    gpio_init(PIN_ECHO);
+    gpio_set_dir(PIN_ECHO, GPIO_IN);
+    gpio_set_irq_enabled_with_callback(PIN_ECHO, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &tratador_interrupcao_echo);
+
+    int tempo1 = 0;
+    int tempo2 = 0;
 
     while (true) {
-        if (xQueueReceive(queueMedidasTempo, &tempoPulso, pdMS_TO_TICKS(100))) {
-            float distanciaCM = (tempoPulso * 0.0343f) / 2.0f;
+        // Aguarda dois tempos na fila: subida e descida
+        if (xQueueReceive(queueMedidasTempo, &tempo1, pdMS_TO_TICKS(100))) {
+            if (xQueueReceive(queueMedidasTempo, &tempo2, pdMS_TO_TICKS(100))) {
+                if (tempo2 > tempo1) {
+                    int duracao = tempo2 - tempo1;
+                    float distanciaCM = (duracao * 0.0343f) / 2.0f;
 
-            if (distanciaCM < 2 || distanciaCM > 400) {
-                distanciaCM = -1.0f;
+                    if (distanciaCM < 2 || distanciaCM > 400) {
+                        distanciaCM = -1.0f;
+                    }
+
+                    xQueueSend(queueDistancias, &distanciaCM, 0);
+                }
+                xSemaphoreGive(semaforoDisparo); // Pronto para nova medição
             }
-
-            xQueueSend(queueDistancias, &distanciaCM, 0);
-            xSemaphoreGive(semaforoDisparo);
         }
     }
 }
 
-// Tarefa que exibe as informações no display OLED
+// Tarefa que exibe a distância no OLED
 void tarefa_oled_display(void *param) {
     ssd1306_t display;
     ssd1306_init();
     gfx_init(&display, 128, 32);
 
-    float valorDistancia = 0.0f;
-    char mensagem[32];
+    float distancia = 0;
+    char texto[32];
 
     while (true) {
-        if (xQueueReceive(queueDistancias, &valorDistancia, pdMS_TO_TICKS(100))) {
+        if (xQueueReceive(queueDistancias, &distancia, pdMS_TO_TICKS(100))) {
             gfx_clear_buffer(&display);
 
-            if (valorDistancia >= 2 && valorDistancia <= 400) {
-                snprintf(mensagem, sizeof(mensagem), "Distancia: %.2f cm", valorDistancia);
-                gfx_draw_string(&display, 0, 10, 1, mensagem);
+            if (distancia >= 2 && distancia <= 400) {
+                snprintf(texto, sizeof(texto), "Distancia: %.2f cm", distancia);
+                gfx_draw_string(&display, 0, 10, 1, texto);
             } else {
                 gfx_draw_string(&display, 0, 10, 1, "Erro: fora de alcance");
             }
 
-            int tamanhoBarra = (valorDistancia > 112) ? 112 : (int)valorDistancia;
-            gfx_draw_line(&display, 0, 27, tamanhoBarra, 27);
+            int barra = (distancia > 112) ? 112 : (int)distancia;
+            gfx_draw_line(&display, 0, 27, barra, 27);
         } else {
             gfx_clear_buffer(&display);
             gfx_draw_string(&display, 0, 10, 1, "Erro: sem leitura");
@@ -107,33 +111,21 @@ void tarefa_oled_display(void *param) {
     }
 }
 
+// Função principal
 int main() {
     stdio_init_all();
 
-    gpio_init(PIN_ECHO);
-    gpio_set_dir(PIN_ECHO, GPIO_IN);
-    gpio_set_irq_enabled_with_callback(PIN_ECHO, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &tratador_interrupcao_echo);
-
-    gpio_init(PIN_TRIGGER);
-    gpio_set_dir(PIN_TRIGGER, GPIO_OUT);
-
-    // Inicialização das filas e semáforo
     queueMedidasTempo = xQueueCreate(32, sizeof(int));
     queueDistancias = xQueueCreate(32, sizeof(float));
     semaforoDisparo = xSemaphoreCreateBinary();
 
-    // Libera o semáforo para o primeiro disparo
     xSemaphoreGive(semaforoDisparo);
 
-    // Criação das tarefas do FreeRTOS
-    xTaskCreate(tarefa_disparo_ultrassom, "DisparoUltrassom", 4096, NULL, 1, NULL);
-    xTaskCreate(tarefa_medicao_echo, "MedicaoEcho", 4096, NULL, 1, NULL);
-    xTaskCreate(tarefa_oled_display, "OLED_Display", 4096, NULL, 1, NULL);
+    xTaskCreate(tarefa_disparo_ultrassom, "Disparo", 4096, NULL, 1, NULL);
+    xTaskCreate(tarefa_medicao_echo, "Echo", 4096, NULL, 1, NULL);
+    xTaskCreate(tarefa_oled_display, "Display", 4096, NULL, 1, NULL);
 
-    // Inicia o escalonador do FreeRTOS
     vTaskStartScheduler();
 
-    while (true) {
-        // Loop infinito caso o escalonador falhe
-    }
+    while (true) {}
 }
