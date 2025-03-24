@@ -37,8 +37,6 @@ void tratador_interrupcao_echo(uint gpio, uint32_t eventos) {
 
 // Tarefa que dispara o sinal ultrassônico
 void tarefa_disparo_ultrassom(void *param) {
-    gpio_init(PIN_TRIGGER);
-    gpio_set_dir(PIN_TRIGGER, GPIO_OUT);
 
     while (true) {
         if (xSemaphoreTake(semaforoDisparo, pdMS_TO_TICKS(200))) {
@@ -52,9 +50,6 @@ void tarefa_disparo_ultrassom(void *param) {
 
 // Tarefa que mede a distância
 void tarefa_medicao_echo(void *param) {
-    gpio_init(PIN_ECHO);
-    gpio_set_dir(PIN_ECHO, GPIO_IN);
-    gpio_set_irq_enabled_with_callback(PIN_ECHO, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &tratador_interrupcao_echo);
 
     int tempo1 = 0;
     int tempo2 = 0;
@@ -96,14 +91,14 @@ void tarefa_oled_display(void *param) {
                 snprintf(texto, sizeof(texto), "Distancia: %.2f cm", distancia);
                 gfx_draw_string(&display, 0, 10, 1, texto);
             } else {
-                gfx_draw_string(&display, 0, 10, 1, "Erro: fora de alcance");
+                gfx_draw_string(&display, 0, 10, 1, "Falha: fora de alcance");
             }
 
             int barra = (distancia > 112) ? 112 : (int)distancia;
             gfx_draw_line(&display, 0, 27, barra, 27);
         } else {
             gfx_clear_buffer(&display);
-            gfx_draw_string(&display, 0, 10, 1, "Erro: sem leitura");
+            gfx_draw_string(&display, 0, 10, 1, "Falha: erro na leitura");
         }
 
         gfx_show(&display);
@@ -113,6 +108,15 @@ void tarefa_oled_display(void *param) {
 
 // Função principal
 int main() {
+
+    gpio_init(PIN_TRIGGER);
+    gpio_set_dir(PIN_TRIGGER, GPIO_OUT);
+
+    gpio_init(PIN_ECHO);
+    gpio_set_dir(PIN_ECHO, GPIO_IN);
+    gpio_set_irq_enabled_with_callback(PIN_ECHO, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &tratador_interrupcao_echo);
+
+
     stdio_init_all();
 
     queueMedidasTempo = xQueueCreate(32, sizeof(int));
