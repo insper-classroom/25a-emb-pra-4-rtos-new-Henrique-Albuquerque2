@@ -1,6 +1,3 @@
-/*
- * LED blink with FreeRTOS
- */
 #include <FreeRTOS.h>
 #include <task.h>
 #include <semphr.h>
@@ -12,9 +9,7 @@
 #include "pico/stdlib.h"
 #include <stdio.h>
 
-#include "hardware/gpio.h"
-#include "hardware/timer.h"
-
+// Constantes dos botões e LEDs (mantidas conforme solicitado)
 const uint BTN_1_OLED = 28;
 const uint BTN_2_OLED = 26;
 const uint BTN_3_OLED = 27;
@@ -23,125 +18,122 @@ const uint LED_1_OLED = 20;
 const uint LED_2_OLED = 21;
 const uint LED_3_OLED = 22;
 
-// === Pinos do sensor ultrassônico ===
-#define TRIGGER_PIN 3
-#define ECHO_PIN 2
+// Pinos do sensor ultrassônico
+const uint PIN_ECHO = 7;
+const uint PIN_TRIGGER = 6;
 
-// === Definição dos recursos RTOS ===
-SemaphoreHandle_t xSemaphoreTrigger;
-QueueHandle_t xQueueTime;
-QueueHandle_t xQueueDistance;
+// Filas e semáforo para comunicação entre tarefas
+QueueHandle_t queueMedidasTempo;
+QueueHandle_t queueDistancias;
+SemaphoreHandle_t semaforoDisparo;
 
-typedef struct {
-    uint64_t start;
-    uint64_t end;
-} echo_time_t;
+// Flag de estado para borda de subida/descida
+volatile bool aguardandoSubida = true;
 
-volatile bool rising = true;
-echo_time_t echo;
+// Interrupção do pino de ECHO
+void tratador_interrupcao_echo(uint gpio, uint32_t eventos) {
+    static int instanteSubida = 0;
+    int tempoAtual = to_us_since_boot(get_absolute_time());
 
-// === Callback do pino de interrupção (ECHO) ===
-void pin_callback(uint gpio, uint32_t events) {
-    if (events & GPIO_IRQ_EDGE_RISE) {
-        echo.start = to_us_since_boot(get_absolute_time());
-        rising = false;
-    } else if (events & GPIO_IRQ_EDGE_FALL) {
-        echo.end = to_us_since_boot(get_absolute_time());
-        rising = true;
-
-        xQueueSendFromISR(xQueueTime, &echo, NULL);
+    if (aguardandoSubida && (eventos & GPIO_IRQ_EDGE_RISE)) {
+        instanteSubida = tempoAtual;
+        aguardandoSubida = false;
+    } else if (!aguardandoSubida && (eventos & GPIO_IRQ_EDGE_FALL)) {
+        int duracaoPulso = tempoAtual - instanteSubida;
+        xQueueSendFromISR(queueMedidasTempo, &duracaoPulso, NULL);
+        aguardandoSubida = true;
     }
 }
 
-// === Task: envia o pulso TRIGGER ===
-void trigger_task(void *p) {
-    while (1) {
-        gpio_put(TRIGGER_PIN, 1);
-        sleep_us(10);
-        gpio_put(TRIGGER_PIN, 0);
-
-        xSemaphoreGive(xSemaphoreTrigger); // Avisa o OLED que teve leitura
-
-        vTaskDelay(pdMS_TO_TICKS(100)); // Espera entre medições
+// Tarefa que dispara o sinal ultrassônico
+void tarefa_disparo_ultrassom(void *param) {
+    while (true) {
+        if (xSemaphoreTake(semaforoDisparo, pdMS_TO_TICKS(200))) {
+            gpio_put(PIN_TRIGGER, 1);
+            sleep_us(10); // Pulso de 10 microsegundos
+            gpio_put(PIN_TRIGGER, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-// === Task: calcula a distância com base no tempo do Echo ===
-void echo_task(void *p) {
-    echo_time_t time;
-    while (1) {
-        if (xQueueReceive(xQueueTime, &time, portMAX_DELAY)) {
-            uint64_t duration = time.end - time.start;
-            float distance_cm = (duration * 0.0343f) / 2.0f;
+// Tarefa que mede a resposta do sensor
+void tarefa_medicao_echo(void *param) {
+    int tempoPulso = 0;
 
-            if (distance_cm < 400.0f) {
-                xQueueSend(xQueueDistance, &distance_cm, portMAX_DELAY);
-            } else {
-                float erro = -1.0f;
-                xQueueSend(xQueueDistance, &erro, portMAX_DELAY);
+    while (true) {
+        if (xQueueReceive(queueMedidasTempo, &tempoPulso, pdMS_TO_TICKS(100))) {
+            float distanciaCM = (tempoPulso * 0.0343f) / 2.0f;
+
+            if (distanciaCM < 2 || distanciaCM > 400) {
+                distanciaCM = -1.0f;
             }
+
+            xQueueSend(queueDistancias, &distanciaCM, 0);
+            xSemaphoreGive(semaforoDisparo);
         }
     }
 }
 
-// === Task: exibe a distância ou erro no display OLED ===
-void oled_task(void *p) {
-    ssd1306_t disp;
+// Tarefa que exibe as informações no display OLED
+void tarefa_oled_display(void *param) {
+    ssd1306_t display;
     ssd1306_init();
-    gfx_init(&disp, 128, 32);
+    gfx_init(&display, 128, 32);
 
-    float distance = 0;
+    float valorDistancia = 0.0f;
+    char mensagem[32];
 
-    while (1) {
-        if (xQueueReceive(xQueueDistance, &distance, pdMS_TO_TICKS(300))) {
-            gfx_clear_buffer(&disp);
+    while (true) {
+        if (xQueueReceive(queueDistancias, &valorDistancia, pdMS_TO_TICKS(100))) {
+            gfx_clear_buffer(&display);
 
-            if (distance < 0) {
-                gfx_draw_string(&disp, 0, 0, 1, "Erro na leitura");
+            if (valorDistancia >= 2 && valorDistancia <= 400) {
+                snprintf(mensagem, sizeof(mensagem), "Distancia: %.2f cm", valorDistancia);
+                gfx_draw_string(&display, 0, 10, 1, mensagem);
             } else {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "Distancia: %.1f cm", distance);
-                gfx_draw_string(&disp, 0, 0, 1, buf);
-
-                int bar = distance > 100 ? 100 : (int)distance;
-                gfx_draw_line(&disp, 0, 25, bar, 25);
+                gfx_draw_string(&display, 0, 10, 1, "Erro: fora de alcance");
             }
 
-            gfx_show(&disp);
+            int tamanhoBarra = (valorDistancia > 112) ? 112 : (int)valorDistancia;
+            gfx_draw_line(&display, 0, 27, tamanhoBarra, 27);
+        } else {
+            gfx_clear_buffer(&display);
+            gfx_draw_string(&display, 0, 10, 1, "Erro: sem leitura");
         }
+
+        gfx_show(&display);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-// === Função principal ===
 int main() {
     stdio_init_all();
 
-    // Configura os pinos do sensor
-    gpio_init(TRIGGER_PIN);
-    gpio_set_dir(TRIGGER_PIN, GPIO_OUT);
-    gpio_put(TRIGGER_PIN, 0);
+    gpio_init(PIN_ECHO);
+    gpio_set_dir(PIN_ECHO, GPIO_IN);
+    gpio_set_irq_enabled_with_callback(PIN_ECHO, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &tratador_interrupcao_echo);
 
-    gpio_init(ECHO_PIN);
-    gpio_set_dir(ECHO_PIN, GPIO_IN);
-    gpio_pull_down(ECHO_PIN);
+    gpio_init(PIN_TRIGGER);
+    gpio_set_dir(PIN_TRIGGER, GPIO_OUT);
 
-    gpio_set_irq_enabled_with_callback(ECHO_PIN,
-        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &pin_callback);
+    // Inicialização das filas e semáforo
+    queueMedidasTempo = xQueueCreate(32, sizeof(int));
+    queueDistancias = xQueueCreate(32, sizeof(float));
+    semaforoDisparo = xSemaphoreCreateBinary();
 
-    // Inicializa recursos RTOS
-    xSemaphoreTrigger = xSemaphoreCreateBinary();
-    xQueueTime = xQueueCreate(4, sizeof(echo_time_t));
-    xQueueDistance = xQueueCreate(4, sizeof(float));
+    // Libera o semáforo para o primeiro disparo
+    xSemaphoreGive(semaforoDisparo);
 
-    // Cria as tasks
-    xTaskCreate(trigger_task, "Trigger", 1024, NULL, 1, NULL);
-    xTaskCreate(echo_task, "Echo", 1024, NULL, 1, NULL);
-    xTaskCreate(oled_task, "OLED", 2048, NULL, 1, NULL);
+    // Criação das tarefas do FreeRTOS
+    xTaskCreate(tarefa_disparo_ultrassom, "DisparoUltrassom", 4096, NULL, 1, NULL);
+    xTaskCreate(tarefa_medicao_echo, "MedicaoEcho", 4096, NULL, 1, NULL);
+    xTaskCreate(tarefa_oled_display, "OLED_Display", 4096, NULL, 1, NULL);
 
-    // Inicia o scheduler
+    // Inicia o escalonador do FreeRTOS
     vTaskStartScheduler();
 
-    // Nunca deve chegar aqui
-    while (true)
-        tight_loop_contents();
+    while (true) {
+        // Loop infinito caso o escalonador falhe
+    }
 }
